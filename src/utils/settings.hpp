@@ -3,6 +3,7 @@
 #define ImTextureID ImU64
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <optional>
@@ -897,4 +898,212 @@ static void Use(
   }
 }
 
+// ---- host API -------------------------------------------------------------------------------
+//
+// A C ABI another module in the same process can use to read and drive this addon's settings.
+// ReShade's overlay is the only way in today, which is right for a person at a keyboard and no use
+// to a tool: an external panel, a launcher, or a second addon that wants to present these controls
+// in its own UI cannot reach them at all.
+//
+// It is a facade, not a layer. Every entry point below is FindSetting, UpdateSetting or
+// SaveSettings -- the functions the overlay itself calls -- so there is no second copy of the
+// locking, the write path or the preset rules to keep in step.
+//
+// Exported from settings.hpp on purpose: every addon compiles this header into its single
+// translation unit, so one definition here gives every addon the export without touching 271
+// addon.cpp files or any build file. It sits beside the NAME export above, which already
+// establishes that this header owns an exported symbol.
+//
+// Compatibility: `struct_size` on both structs and `api_version` are the whole contract. A caller
+// passes the version it was built against and gets nullptr if this build cannot serve it; it then
+// checks `struct_size` before reading a field, so adding members later does not break an older
+// caller. Do not reorder or remove members -- append only.
+
+inline constexpr uint32_t HOST_API_VERSION = 1u;
+
+enum RenoDxHostValueType : uint32_t {
+  RENODX_HOST_VALUE_FLOAT = 0,
+  RENODX_HOST_VALUE_INTEGER = 1,
+  RENODX_HOST_VALUE_BOOLEAN = 2,
+  // An integer whose values are named: `label_count` is non-zero and RenoDxHostLabelAt names each.
+  RENODX_HOST_VALUE_COMBO = 3,
+  RENODX_HOST_VALUE_TEXT = 4,
+};
+
+struct RenoDxHostSetting {
+  uint32_t struct_size;
+  // Borrowed from the Setting itself and valid only until the next call into this API on this
+  // thread. A caller that keeps a description copies the strings.
+  const char* key;
+  const char* label;
+  const char* section;
+  const char* group;
+  const char* tooltip;
+  const char* format;
+  uint32_t value_type;
+  float min_value;
+  float max_value;
+  uint32_t label_count;
+  // The addon's own answer to "should this be shown / is it live right now", so a host UI can grey
+  // a control the overlay would also grey rather than offering a value the mod will ignore.
+  int32_t is_visible;
+  int32_t is_enabled;
+  int32_t is_global;
+};
+
+struct RenoDxHostApi {
+  uint32_t struct_size;
+  uint32_t api_version;
+  // The ReShade config section this addon reads and writes -- `global_name`. A host that wants to
+  // find the same values on disk needs this; guessing "renodx" is wrong for any mod that sets it.
+  const char* (*addon_name)();
+  uint32_t (*setting_count)();
+  // False when `index` is out of range or `out->struct_size` is smaller than this build's struct.
+  bool (*describe_setting)(uint32_t index, RenoDxHostSetting* out);
+  // One label of a COMBO setting. Separate from describe_setting because the labels are
+  // std::strings owned by the Setting: handing out an array of pointers would mean caching one,
+  // and a cache is a lifetime bug waiting to happen for a caller that holds it too long.
+  const char* (*label_at)(uint32_t index, uint32_t label_index);
+  bool (*get_number)(const char* key, float* out);
+  bool (*set_number)(const char* key, float value);
+  // Writes at most `buf_size` bytes including the terminator; false if the value does not fit, and
+  // the buffer is then left empty rather than truncated into something that reads as a real value.
+  bool (*get_text)(const char* key, char* buf, uint32_t buf_size);
+  bool (*set_text)(const char* key, const char* value);
+  // Persist to the current preset's config section, as the overlay does after a change.
+  void (*save)();
+};
+
+// The C ABI is only an ABI if the layout is one C understands, and that is a property a later
+// edit can quietly remove -- a std::string field, a virtual, a base class. Asserted here rather
+// than in test/api_compatibility because every addon compiles this header, so every addon build
+// is the check.
+static_assert(std::is_standard_layout_v<RenoDxHostSetting>);
+static_assert(std::is_standard_layout_v<RenoDxHostApi>);
+
+namespace host_api_detail {
+
+inline const char* AddonName() {
+  return global_name.c_str();
+}
+
+inline uint32_t SettingCount() {
+  if (settings == nullptr) return 0u;
+  const std::shared_lock lock(renodx::utils::mutex::global_mutex);
+  return static_cast<uint32_t>(settings->size());
+}
+
+inline Setting* At(uint32_t index) {
+  if (settings == nullptr || index >= settings->size()) return nullptr;
+  return settings->at(index);
+}
+
+inline uint32_t ValueTypeOf(const Setting* setting) {
+  switch (setting->value_type) {
+    case SettingValueType::INTEGER:
+      return setting->labels.empty() ? RENODX_HOST_VALUE_INTEGER : RENODX_HOST_VALUE_COMBO;
+    case SettingValueType::BOOLEAN:
+      return RENODX_HOST_VALUE_BOOLEAN;
+    case SettingValueType::INPUT_TEXT:
+      return RENODX_HOST_VALUE_TEXT;
+    default:
+      return RENODX_HOST_VALUE_FLOAT;
+  }
+}
+
+inline bool DescribeSetting(uint32_t index, RenoDxHostSetting* out) {
+  if (out == nullptr || out->struct_size < sizeof(RenoDxHostSetting)) return false;
+  Setting* setting = nullptr;
+  {
+    const std::shared_lock lock(renodx::utils::mutex::global_mutex);
+    setting = At(index);
+    if (setting == nullptr) return false;
+    out->key = setting->key.c_str();
+    out->label = setting->label.c_str();
+    out->section = setting->section.c_str();
+    out->group = setting->group.c_str();
+    out->tooltip = setting->tooltip.c_str();
+    out->format = setting->format.c_str();
+    out->value_type = ValueTypeOf(setting);
+    out->min_value = setting->min;
+    out->max_value = setting->GetMax();
+    out->label_count = static_cast<uint32_t>(setting->labels.size());
+    out->is_global = setting->is_global ? 1 : 0;
+  }
+  // Outside the lock, because these two are the mod author's own lambdas and one of them calling
+  // UpdateSetting would deadlock on a shared_mutex we already hold. The overlay's own draw path
+  // calls them unlocked for the same reason, so this matches it rather than inventing a stricter
+  // rule that only this entry point obeys.
+  out->is_visible = setting->is_visible == nullptr || setting->is_visible() ? 1 : 0;
+  out->is_enabled = setting->is_enabled == nullptr || setting->is_enabled() ? 1 : 0;
+  return true;
+}
+
+inline const char* LabelAt(uint32_t index, uint32_t label_index) {
+  const std::shared_lock lock(renodx::utils::mutex::global_mutex);
+  auto* setting = At(index);
+  if (setting == nullptr || label_index >= setting->labels.size()) return nullptr;
+  return setting->labels.at(label_index).c_str();
+}
+
+inline bool GetNumber(const char* key, float* out) {
+  if (key == nullptr || out == nullptr) return false;
+  const std::shared_lock lock(renodx::utils::mutex::global_mutex);
+  auto* setting = FindSetting(key);
+  if (setting == nullptr || !setting->HasNumericValue()) return false;
+  *out = setting->GetValue();
+  return true;
+}
+
+inline bool GetText(const char* key, char* buf, uint32_t buf_size) {
+  if (key == nullptr || buf == nullptr || buf_size == 0u) return false;
+  buf[0] = '\0';
+  const std::shared_lock lock(renodx::utils::mutex::global_mutex);
+  auto* setting = FindSetting(key);
+  if (setting == nullptr) return false;
+  const auto text = setting->GetTextValue();
+  if (text.size() + 1u > buf_size) return false;
+  std::memcpy(buf, text.c_str(), text.size() + 1u);
+  return true;
+}
+
+inline bool SetNumber(const char* key, float value) {
+  // UpdateSetting takes the write lock and calls Set()->Write(), which is what runs the setting's
+  // on_change callbacks. Reaching past it into Setting::Set would skip them.
+  return key != nullptr && UpdateSetting(std::string(key), value);
+}
+
+inline bool SetText(const char* key, const char* value) {
+  return key != nullptr && value != nullptr && UpdateSetting(std::string(key), std::string(value));
+}
+
+inline void Save() {
+  SaveSettings();
+  SaveGlobalSettings();
+}
+
+inline const RenoDxHostApi API = {
+    .struct_size = sizeof(RenoDxHostApi),
+    .api_version = HOST_API_VERSION,
+    .addon_name = AddonName,
+    .setting_count = SettingCount,
+    .describe_setting = DescribeSetting,
+    .label_at = LabelAt,
+    .get_number = GetNumber,
+    .set_number = SetNumber,
+    .get_text = GetText,
+    .set_text = SetText,
+    .save = Save,
+};
+
+}  // namespace host_api_detail
+
 }  // namespace renodx::utils::settings
+
+// Outside the namespace so the exported name is exactly `RenoDxGetHostApi`, which is what a caller
+// resolves with GetProcAddress. Returns nullptr when the caller wants a version this build predates.
+extern "C" __declspec(dllexport) inline const renodx::utils::settings::RenoDxHostApi* RenoDxGetHostApi(
+    uint32_t requested_version) {
+  if (requested_version > renodx::utils::settings::HOST_API_VERSION) return nullptr;
+  return &renodx::utils::settings::host_api_detail::API;
+}
