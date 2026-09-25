@@ -37,6 +37,7 @@
 #include "../utils/device_upgrade.hpp"
 #include "../utils/draw.hpp"
 #include "../utils/format.hpp"
+#include "../utils/host_graphics.hpp"
 #include "../utils/mutex.hpp"
 #include "../utils/pipeline.hpp"
 #include "../utils/resource.hpp"
@@ -404,6 +405,203 @@ inline void SetUpgradeResourceViews(const bool& value = true) {
 
 // Hooks
 
+// NVIDIA Streamline DLSS Frame Generation reads colour images a host tags for it (HUD-less colour, the
+// back buffer) and compares them with the frame it is handed at present. When ReShade sits above
+// Streamline that frame has been through the swap chain proxy pass, so a tagged image has to be too, or
+// every generated frame is built from differently encoded inputs than the real ones. These back the
+// host API's resolve_clone and encode_for_swapchain (utils/host_graphics.hpp).
+namespace streamline_tags {
+
+struct EncodeJob {
+  reshade::api::device* device = nullptr;
+  reshade::api::resource output = {0u};
+  reshade::api::resource_usage state = reshade::api::resource_usage::undefined;
+  bool pending = false;
+  renodx::utils::render::RenderPass pass;
+};
+
+inline std::mutex jobs_mutex;
+// <tagged resource handle, job>
+inline std::unordered_map<uint64_t, EncodeJob> jobs;
+
+inline reshade::api::resource_usage UsageFromD3D12State(uint32_t state) {
+  // reshade::api::resource_usage mirrors D3D12_RESOURCE_STATES bit for bit, except COMMON (0).
+  return state == 0u ? reshade::api::resource_usage::general : static_cast<reshade::api::resource_usage>(state);
+}
+
+inline bool ResolveClone(void* native_resource, void** out_native_resource) {
+  if (native_resource == nullptr || out_native_resource == nullptr) return false;
+  reshade::api::resource clone = {0u};
+  utils::resource::GetResourceInfo(
+      reshade::api::resource{reinterpret_cast<uint64_t>(native_resource)},
+      [&clone](const utils::resource::ResourceInfo& info) {
+        if (info.clone_enabled && info.clone.handle != 0u) clone = info.clone;
+      });
+  if (clone.handle == 0u) return false;
+  *out_native_resource = reinterpret_cast<void*>(clone.handle);
+  return true;
+}
+
+inline bool EncodeForSwapchain(void* native_resource, uint32_t d3d12_state, void** out_native_resource,
+                               uint32_t* out_d3d12_state) {
+  if (native_resource == nullptr || out_native_resource == nullptr || out_d3d12_state == nullptr) return false;
+  const reshade::api::resource resource = {reinterpret_cast<uint64_t>(native_resource)};
+
+  reshade::api::device* device = nullptr;
+  reshade::api::resource_desc desc = {};
+  if (!utils::resource::GetResourceInfo(resource, [&](const utils::resource::ResourceInfo& info) {
+        device = info.device;
+        desc = info.desc;
+      })) {
+    return false;
+  }
+  if (device == nullptr || device->get_api() != reshade::api::device_api::d3d12) return false;
+  if (desc.type != reshade::api::resource_type::texture_2d) return false;
+
+  auto* data = renodx::utils::data::Get<DeviceData>(device);
+  if (data == nullptr || data->swap_chain_proxy_pixel_shader.empty()) return false;
+  const auto swapchain_format = data->primary_swapchain_resource_desc.texture.format;
+  if (swapchain_format == reshade::api::format::unknown) return false;
+
+  const std::unique_lock lock(jobs_mutex);
+  auto& job = jobs[resource.handle];
+  if (job.output.handle == 0u) {
+    // Treated like a swap chain buffer from here on: the game's copies from the (cloned) back buffer
+    // into it stay format-compatible and land, unclipped, in its clone.
+    utils::resource::UpdateResourceInfo(resource, [data](utils::resource::ResourceInfo* info) {
+      if (info->clone_target != nullptr) return;
+      info->clone_target = &data->swap_chain_clone_info;
+      info->clone_enabled = true;
+      info->clone_can_deactivate = false;
+    });
+
+    const reshade::api::resource_desc output_desc(
+        desc.texture.width, desc.texture.height, 1, 1, swapchain_format, 1,
+        reshade::api::memory_heap::gpu_only,
+        reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource);
+    if (!device->create_resource(output_desc, nullptr, reshade::api::resource_usage::shader_resource, &job.output)) {
+      jobs.erase(resource.handle);
+      reshade::log::message(reshade::log::level::warning,
+                            "mods::swapchain::streamline_tags(could not create the encoded texture)");
+      return false;
+    }
+    job.device = device;
+
+    std::stringstream s;
+    s << "mods::swapchain::streamline_tags(encoding " << PRINT_PTR(resource.handle);
+    s << " " << desc.texture.width << "x" << desc.texture.height << " " << desc.texture.format;
+    s << " into " << PRINT_PTR(job.output.handle) << " " << swapchain_format << " at each present)";
+    reshade::log::message(reshade::log::level::info, s.str().c_str());
+  }
+  job.state = UsageFromD3D12State(d3d12_state);
+  job.pending = true;
+
+  *out_native_resource = reinterpret_cast<void*>(job.output.handle);
+  *out_d3d12_state = static_cast<uint32_t>(reshade::api::resource_usage::shader_resource);
+  return true;
+}
+
+// At present, before the frame leaves ReShade (and so before Streamline reads the tags).
+inline void RunEncodes(reshade::api::command_queue* queue, DeviceData* data) {
+  const std::unique_lock lock(jobs_mutex);
+  if (jobs.empty()) return;
+
+  auto* cmd_list = queue->get_immediate_command_list();
+  auto* device = queue->get_device();
+  for (auto it = jobs.begin(); it != jobs.end();) {
+    auto& job = it->second;
+    const reshade::api::resource tagged = {it->first};
+
+    bool alive = false;
+    reshade::api::resource source = tagged;
+    utils::resource::GetResourceInfo(tagged, [&](const utils::resource::ResourceInfo& info) {
+      alive = !info.destroyed;
+      if (info.clone_enabled && info.clone.handle != 0u) source = info.clone;
+    });
+    if (!alive) {
+      job.pass.DestroyAll(job.device);
+      job.device->destroy_resource(job.output);
+      it = jobs.erase(it);
+      continue;
+    }
+    if (!job.pending || job.device != device) {
+      ++it;
+      continue;
+    }
+    job.pending = false;
+
+    // A tagged image already in a shader resource state needs no transition of its own.
+    const bool move_source = job.state != reshade::api::resource_usage::shader_resource;
+    const std::array pre_resources = {job.output, source};
+    const std::array pre_old = {reshade::api::resource_usage::shader_resource, job.state};
+    const std::array pre_new = {reshade::api::resource_usage::render_target,
+                                reshade::api::resource_usage::shader_resource};
+    cmd_list->barrier(move_source ? 2u : 1u, pre_resources.data(), pre_old.data(), pre_new.data());
+
+    auto& pass = job.pass;
+    if (pass.render_target_slots.resources.size() != 1 || pass.render_target_slots.resources[0].handle != job.output.handle) {
+      pass.render_target_slots.views.clear();
+      pass.render_target_slots.view_descs.clear();
+      pass.render_target_slots.resource_descs.clear();
+      pass.render_target_slots.resources = {job.output};
+    }
+    if (pass.shader_resource_slots.resources.size() != 1 || pass.shader_resource_slots.resources[0].handle != source.handle) {
+      pass.shader_resource_slots.views.clear();
+      pass.shader_resource_slots.view_descs.clear();
+      pass.shader_resource_slots.resource_descs.clear();
+      pass.shader_resource_slots.resources = {source};
+    }
+    pass.revert_state_after_render = false;
+    pass.render_target_load_op = reshade::api::render_pass_load_op::discard;
+    pass.pipeline_subobjects.vertex_shader = data->swap_chain_proxy_vertex_shader;
+    pass.pipeline_subobjects.pixel_shader = data->swap_chain_proxy_pixel_shader;
+    pass.pipeline_subobjects.compute_shader = {};
+    if (pass.sampler_descs.empty()) pass.sampler_descs.push_back(reshade::api::sampler_desc{});
+    pass.push_constants.clear();
+    if (shader_injection_size != 0u) {
+      const renodx::utils::render::ConstantBuffersSlots slot = {
+          .slot = static_cast<uint8_t>(data->expected_constant_buffer_index == -1
+                                           ? 0
+                                           : data->expected_constant_buffer_index),
+          .space = static_cast<uint8_t>(data->expected_constant_buffer_space),
+      };
+      pass.push_constants[slot] = std::span<const float>(shader_injection, shader_injection_size);
+    }
+    const bool rendered = pass.Render(cmd_list, queue);
+
+    const std::array post_resources = {job.output, source};
+    const std::array post_old = {reshade::api::resource_usage::render_target,
+                                 reshade::api::resource_usage::shader_resource};
+    const std::array post_new = {reshade::api::resource_usage::shader_resource, job.state};
+    cmd_list->barrier(move_source ? 2u : 1u, post_resources.data(), post_old.data(), post_new.data());
+
+    if (!rendered) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        reshade::log::message(reshade::log::level::warning,
+                              "mods::swapchain::streamline_tags(swap chain proxy pass over a tagged image failed)");
+      }
+    }
+    ++it;
+  }
+}
+
+inline void DestroyForDevice(reshade::api::device* device) {
+  const std::unique_lock lock(jobs_mutex);
+  for (auto it = jobs.begin(); it != jobs.end();) {
+    if (it->second.device == device) {
+      it->second.pass.DestroyAll(device);
+      device->destroy_resource(it->second.output);
+      it = jobs.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+}  // namespace streamline_tags
+
 static void OnInitDevice(reshade::api::device* device) {
   if (ignored_device_apis.contains(device->get_api())) {
     std::stringstream s;
@@ -490,6 +688,7 @@ static void OnDestroyDevice(reshade::api::device* device) {
   if (data == nullptr) return;
 
   DestroySwapchainProxyItems(device, data);
+  streamline_tags::DestroyForDevice(device);
   renodx::utils::data::Delete(device, data);
 }
 
@@ -1228,6 +1427,8 @@ inline void OnPresent(
     return;
   }
 
+  streamline_tags::RunEncodes(queue, data);
+
   const auto back_buffer_handle = swapchain->get_current_back_buffer().handle;
   auto pass_pointer = data->swapchain_proxy_passes.find(back_buffer_handle);
   renodx::utils::draw::SwapchainProxyPass* proxy_pass = nullptr;
@@ -1301,7 +1502,9 @@ static void Use(DWORD fdw_reason, T* new_injections = nullptr) {
             shader_injection_size = sizeof(T) / sizeof(uint32_t);
             shader_injection = reinterpret_cast<float*>(new_injections);
           }
+          utils::host_graphics::encode_for_swapchain = &streamline_tags::EncodeForSwapchain;
         }
+        utils::host_graphics::resolve_clone = &streamline_tags::ResolveClone;
       }
 
       reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
@@ -1329,6 +1532,8 @@ static void Use(DWORD fdw_reason, T* new_injections = nullptr) {
       // renodx::utils::resource::on_destroy_resource_view_info_callbacks.erase(&OnDestroyResourceViewInfo);
 
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+      utils::host_graphics::encode_for_swapchain = nullptr;
+      utils::host_graphics::resolve_clone = nullptr;
 
       reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
 
