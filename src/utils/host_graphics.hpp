@@ -23,6 +23,9 @@ inline bool (*resolve_clone)(void* native_resource, void** out_native_resource) 
 inline bool (*encode_for_swapchain)(void* native_resource, uint32_t d3d12_state, void** out_native_resource,
                                     uint32_t* out_d3d12_state) = nullptr;
 
+// See RenoDxHostApi::encode_in_place_for_swapchain.
+inline bool (*encode_in_place_for_swapchain)(void* native_resource, uint32_t d3d12_state, bool is_ui) = nullptr;
+
 // See RenoDxHostApi::encode_ui_for_swapchain.
 inline bool (*encode_ui_for_swapchain)(void* native_resource, uint32_t d3d12_state, void** out_native_resource,
                                        uint32_t* out_d3d12_state) = nullptr;

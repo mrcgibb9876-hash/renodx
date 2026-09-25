@@ -920,7 +920,7 @@ static void Use(
 // checks `struct_size` before reading a field, so adding members later does not break an older
 // caller. Do not reorder or remove members -- append only.
 
-// 2: resolve_clone, encode_for_swapchain and encode_ui_for_swapchain, for a host that hands this addon's images to NVIDIA
+// 2: resolve_clone, encode_for_swapchain, encode_ui_for_swapchain and encode_in_place_for_swapchain, for a host that hands this addon's images to NVIDIA
 //    Streamline DLSS Frame Generation.
 inline constexpr uint32_t HOST_API_VERSION = 2u;
 
@@ -995,6 +995,10 @@ struct RenoDxHostApi {
   // alpha, and only its colour goes through the proxy pass.
   bool (*encode_ui_for_swapchain)(void* native_resource, uint32_t d3d12_state, void** out_native_resource,
                                   uint32_t* out_d3d12_state);
+  // Copy-back: the same pass, its result copied back into the tagged image itself at each present
+  // (keeping alpha when is_ui), so the host leaves the tag as the game set it. True once registered; a
+  // pass that fails simply does not copy back.
+  bool (*encode_in_place_for_swapchain)(void* native_resource, uint32_t d3d12_state, bool is_ui);
 };
 
 // The C ABI is only an ABI if the layout is one C understands, and that is a property a later
@@ -1123,6 +1127,11 @@ inline bool EncodeUiForSwapchain(void* native_resource, uint32_t d3d12_state, vo
                                                    out_d3d12_state);
 }
 
+inline bool EncodeInPlaceForSwapchain(void* native_resource, uint32_t d3d12_state, bool is_ui) {
+  return host_graphics::encode_in_place_for_swapchain != nullptr
+         && host_graphics::encode_in_place_for_swapchain(native_resource, d3d12_state, is_ui);
+}
+
 inline const RenoDxHostApi API = {
     .struct_size = sizeof(RenoDxHostApi),
     .api_version = HOST_API_VERSION,
@@ -1138,6 +1147,7 @@ inline const RenoDxHostApi API = {
     .resolve_clone = ResolveClone,
     .encode_for_swapchain = EncodeForSwapchain,
     .encode_ui_for_swapchain = EncodeUiForSwapchain,
+    .encode_in_place_for_swapchain = EncodeInPlaceForSwapchain,
 };
 
 }  // namespace host_api_detail
