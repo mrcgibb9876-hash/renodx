@@ -922,7 +922,8 @@ static void Use(
 
 // 2: resolve_clone, encode_for_swapchain, encode_ui_for_swapchain and encode_in_place_for_swapchain, for a host that hands this addon's images to NVIDIA
 //    Streamline DLSS Frame Generation.
-inline constexpr uint32_t HOST_API_VERSION = 2u;
+// 3: reset_settings.
+inline constexpr uint32_t HOST_API_VERSION = 3u;
 
 enum RenoDxHostValueType : uint32_t {
   RENODX_HOST_VALUE_FLOAT = 0,
@@ -1004,6 +1005,10 @@ struct RenoDxHostApi {
   // shaders (The Witcher 3, Cyberpunk 2077): its output is the game's own, already in the swap chain's
   // encoding, so a host has nothing to re-order or re-point for Streamline.
   bool (*uses_swapchain_proxy)();
+
+  // Version 3. Every setting the overlay's own reset touches (non-global, can_reset) back to its
+  // default, then saved -- what "Reset all to default" does in a host's UI.
+  void (*reset_settings)();
 };
 
 // The C ABI is only an ABI if the layout is one C understands, and that is a property a later
@@ -1141,6 +1146,12 @@ inline bool UsesSwapchainProxy() {
   return host_graphics::encode_for_swapchain != nullptr;
 }
 
+inline void ResetAll() {
+  if (settings == nullptr) return;
+  ResetSettings(false);
+  Save();
+}
+
 inline const RenoDxHostApi API = {
     .struct_size = sizeof(RenoDxHostApi),
     .api_version = HOST_API_VERSION,
@@ -1158,6 +1169,7 @@ inline const RenoDxHostApi API = {
     .encode_ui_for_swapchain = EncodeUiForSwapchain,
     .encode_in_place_for_swapchain = EncodeInPlaceForSwapchain,
     .uses_swapchain_proxy = UsesSwapchainProxy,
+    .reset_settings = ResetAll,
 };
 
 }  // namespace host_api_detail
