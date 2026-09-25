@@ -1,6 +1,6 @@
 name: snapshot
 
-# TEST BRANCH ONLY (feat/dlssg-tags): this copy builds just the Unreal Engine add-on and publishes it to
+# TEST BRANCH ONLY (feat/dlssg-tags): this copy builds just the Unreal Engine, Witcher 3 and Cyberpunk 2077 add-ons and publishes them to
 # the separate `test-dlssg` prerelease, so a dispatch with --ref feat/dlssg-tags never touches the
 # `snapshot` release or Pages. main keeps its own snapshot.yml.
 
@@ -48,18 +48,20 @@ jobs:
       - name: Configure CMake (x64)
         run: cmake --preset clang-x64 -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
-      - name: Build (x64, unrealengine only)
-        run: cmake --build --preset clang-x64-release --target unrealengine --verbose
+      - name: Build (x64, test add-ons only)
+        run: cmake --build --preset clang-x64-release --target unrealengine thewitcher3 cp2077 --verbose
 
       - name: Prepare Release folder
         run: |
           md githubrelease
           copy build\release\renodx-unrealengine.* githubrelease\
+          copy build\release\renodx-thewitcher3.* githubrelease\
+          copy build\release\renodx-cp2077.* githubrelease\
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: renodx-unrealengine-dlssg
+          name: renodx-dlssg-test-addons
           path: githubrelease
 
       - name: Publish test prerelease

@@ -999,6 +999,11 @@ struct RenoDxHostApi {
   // (keeping alpha when is_ui), so the host leaves the tag as the game set it. True once registered; a
   // pass that fails simply does not copy back.
   bool (*encode_in_place_for_swapchain)(void* native_resource, uint32_t d3d12_state, bool is_ui);
+  // Whether this addon replaces the swap chain's back buffers with clones and writes the presented frame
+  // itself at present (mods::swapchain's proxy pass). False for an addon that only replaces the game's
+  // shaders (The Witcher 3, Cyberpunk 2077): its output is the game's own, already in the swap chain's
+  // encoding, so a host has nothing to re-order or re-point for Streamline.
+  bool (*uses_swapchain_proxy)();
 };
 
 // The C ABI is only an ABI if the layout is one C understands, and that is a property a later
@@ -1132,6 +1137,10 @@ inline bool EncodeInPlaceForSwapchain(void* native_resource, uint32_t d3d12_stat
          && host_graphics::encode_in_place_for_swapchain(native_resource, d3d12_state, is_ui);
 }
 
+inline bool UsesSwapchainProxy() {
+  return host_graphics::encode_for_swapchain != nullptr;
+}
+
 inline const RenoDxHostApi API = {
     .struct_size = sizeof(RenoDxHostApi),
     .api_version = HOST_API_VERSION,
@@ -1148,6 +1157,7 @@ inline const RenoDxHostApi API = {
     .encode_for_swapchain = EncodeForSwapchain,
     .encode_ui_for_swapchain = EncodeUiForSwapchain,
     .encode_in_place_for_swapchain = EncodeInPlaceForSwapchain,
+    .uses_swapchain_proxy = UsesSwapchainProxy,
 };
 
 }  // namespace host_api_detail
