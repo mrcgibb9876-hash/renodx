@@ -920,7 +920,7 @@ static void Use(
 // checks `struct_size` before reading a field, so adding members later does not break an older
 // caller. Do not reorder or remove members -- append only.
 
-// 2: resolve_clone and encode_for_swapchain, for a host that hands this addon's images to NVIDIA
+// 2: resolve_clone, encode_for_swapchain and encode_ui_for_swapchain, for a host that hands this addon's images to NVIDIA
 //    Streamline DLSS Frame Generation.
 inline constexpr uint32_t HOST_API_VERSION = 2u;
 
@@ -984,13 +984,17 @@ struct RenoDxHostApi {
   // The resource the game's writes actually land in when this addon redirects them to a clone; the
   // same lookup RenoDX's dlssfix does in its slSetTag hook.
   bool (*resolve_clone)(void* native_resource, void** out_native_resource);
-  // For a colour image Streamline compares with the presented frame (HUD-less colour, back buffer):
+  // For a colour image Streamline compares with the presented frame (HUD-less colour):
   // a texture of the swap chain's format that receives, at each present and before the frame leaves
   // ReShade, this addon's swap chain proxy pass run over the image (over its clone when it has one),
   // so it is encoded exactly like the frame it is compared with. `d3d12_state` is the state the host
   // tagged the image in; `out_d3d12_state` is the state the returned texture is left in.
   bool (*encode_for_swapchain)(void* native_resource, uint32_t d3d12_state, void** out_native_resource,
                                uint32_t* out_d3d12_state);
+  // The same for a UI colour-and-alpha image: the returned texture keeps the image's own format and
+  // alpha, and only its colour goes through the proxy pass.
+  bool (*encode_ui_for_swapchain)(void* native_resource, uint32_t d3d12_state, void** out_native_resource,
+                                  uint32_t* out_d3d12_state);
 };
 
 // The C ABI is only an ABI if the layout is one C understands, and that is a property a later
@@ -1112,6 +1116,13 @@ inline bool EncodeForSwapchain(void* native_resource, uint32_t d3d12_state, void
          && host_graphics::encode_for_swapchain(native_resource, d3d12_state, out_native_resource, out_d3d12_state);
 }
 
+inline bool EncodeUiForSwapchain(void* native_resource, uint32_t d3d12_state, void** out_native_resource,
+                                 uint32_t* out_d3d12_state) {
+  return host_graphics::encode_ui_for_swapchain != nullptr
+         && host_graphics::encode_ui_for_swapchain(native_resource, d3d12_state, out_native_resource,
+                                                   out_d3d12_state);
+}
+
 inline const RenoDxHostApi API = {
     .struct_size = sizeof(RenoDxHostApi),
     .api_version = HOST_API_VERSION,
@@ -1126,6 +1137,7 @@ inline const RenoDxHostApi API = {
     .save = Save,
     .resolve_clone = ResolveClone,
     .encode_for_swapchain = EncodeForSwapchain,
+    .encode_ui_for_swapchain = EncodeUiForSwapchain,
 };
 
 }  // namespace host_api_detail
