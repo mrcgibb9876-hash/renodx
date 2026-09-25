@@ -3,6 +3,7 @@
 #define ImTextureID ImU64
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -923,7 +924,19 @@ static void Use(
 // 2: resolve_clone, encode_for_swapchain, encode_ui_for_swapchain and encode_in_place_for_swapchain, for a host that hands this addon's images to NVIDIA
 //    Streamline DLSS Frame Generation.
 // 3: reset_settings.
-inline constexpr uint32_t HOST_API_VERSION = 3u;
+// 4: everything else the overlay offers. Presets (preset_count, preset_label, get_preset, set_preset,
+//    preset_style), per-setting reset (reset_setting), BUTTON settings (press), the overlay's title and
+//    which sections it opens by default, and a longer RenoDxHostSetting (kind, default_value, can_reset,
+//    is_using_default, default_text, placeholder, text_max_length, input_text_flags, style, tint,
+//    is_logarithmic, is_sticky). Also from 4, in the older entry points: set_number and set_text run
+//    the setting's on_change / on_change_value / on_change_text exactly as an overlay edit does, and
+//    save() no longer writes preset values into an unnamed section while the preset is Off.
+//
+//    A caller built against 1-3 keeps working unchanged: it passes a RenoDxHostSetting whose
+//    struct_size ends at is_global, and describe_setting fills exactly those fields. A caller built
+//    against 4 checks `api->struct_size >= offsetof(RenoDxHostApi, <field>) + sizeof(void*)` (or
+//    api_version >= 4) before calling a version-4 function, since an older add-on DLL has none.
+inline constexpr uint32_t HOST_API_VERSION = 4u;
 
 enum RenoDxHostValueType : uint32_t {
   RENODX_HOST_VALUE_FLOAT = 0,
@@ -953,7 +966,80 @@ struct RenoDxHostSetting {
   int32_t is_visible;
   int32_t is_enabled;
   int32_t is_global;
+
+  // ---- Version 4. Filled only when the caller's struct_size reaches past is_global; a caller built
+  // against 1-3 passes the shorter struct and gets exactly what it got before. ----
+
+  // What the overlay actually draws: RenoDxHostSettingKind, one value per SettingValueType. value_type
+  // above is kept as it was for older callers (it reports every non-value kind as FLOAT), so a
+  // version-4 host switches on `kind` instead.
+  uint32_t kind;
+  // The value the overlay's reset button restores (numeric kinds; for INPUT_TEXT see default_text).
+  // A mod can change it at run time -- UE-Extended moves Peak Brightness's default to the display's
+  // peak once the swap chain is known -- so read it again rather than caching it.
+  float default_value;
+  // 1 when the overlay draws a reset button for this setting: the mod allows it (can_reset) and the
+  // kind has a value to reset (FLOAT, INTEGER, BOOLEAN, INPUT_TEXT). The overlay also hides the button
+  // while the preset is Off; this field does not fold that in -- see get_preset.
+  int32_t can_reset;
+  // 1 when the value equals its default (the overlay greys its reset button then).
+  int32_t is_using_default;
+  // INPUT_TEXT: the default text and the greyed hint shown while the box is empty. Borrowed, same
+  // lifetime rule as the strings above.
+  const char* default_text;
+  const char* placeholder;
+  // INPUT_TEXT: longest value set_text will keep, in bytes without the terminator, when the mod binds
+  // the text to a fixed buffer (longer text is cut to fit, exactly as the overlay's input box stops
+  // at that length). 0 = no limit (the mod keeps the text in a growable string).
+  uint32_t text_max_length;
+  // INPUT_TEXT: the ImGuiInputTextFlags the mod gave the overlay's input box (ImGui's own bit values,
+  // e.g. ReadOnly, Password, CharsDecimal).
+  uint32_t input_text_flags;
+  // RENODX_HOST_STYLE_* bits: SEGMENTED means the overlay draws a row of buttons instead of a slider
+  // (INTEGER with labels, BOOLEAN); MULTILINE lets that row wrap.
+  uint32_t style;
+  // The mod's accent colour for this control, 0xRRGGBB in tint_rgb when has_tint is 1. The overlay
+  // tints the text of TEXT/TEXT_NOWRAP and the frame/button hue of everything else.
+  int32_t has_tint;
+  uint32_t tint_rgb;
+  // FLOAT/INTEGER: the overlay's slider is logarithmic.
+  int32_t is_logarithmic;
+  // The overlay draws sticky settings above the preset switcher, the rest below it.
+  int32_t is_sticky;
 };
+
+// RenoDxHostSetting::kind. Numerically identical to SettingValueType (asserted below).
+enum RenoDxHostSettingKind : uint32_t {
+  RENODX_HOST_KIND_FLOAT = 0,
+  RENODX_HOST_KIND_INTEGER = 1,  // a slider; a combo when label_count > 0 (label_at names each value)
+  RENODX_HOST_KIND_BOOLEAN = 2,  // label_count is 0 (Off/On) or 2 (the mod's own two names)
+  RENODX_HOST_KIND_BUTTON = 3,   // no value; press() runs it
+  RENODX_HOST_KIND_LABEL = 4,    // read-only "label: text" line; the text is label_at(index, 0)
+  RENODX_HOST_KIND_BULLET = 5,   // bullet point showing `label`
+  RENODX_HOST_KIND_TEXT = 6,     // wrapped text showing `label` (credits, notes, warnings)
+  RENODX_HOST_KIND_TEXT_NOWRAP = 7,
+  // The mod draws this itself with ImGui calls inside ReShade's overlay; there is nothing a host can
+  // drive through this API. Show `label` and point the user at the ReShade overlay.
+  RENODX_HOST_KIND_CUSTOM = 8,
+  RENODX_HOST_KIND_INPUT_TEXT = 9,  // get_text / set_text
+};
+
+enum RenoDxHostStyle : uint32_t {
+  RENODX_HOST_STYLE_SEGMENTED = 1u << 0,
+  RENODX_HOST_STYLE_MULTILINE = 1u << 1,
+};
+
+static_assert(static_cast<uint32_t>(SettingValueType::FLOAT) == RENODX_HOST_KIND_FLOAT);
+static_assert(static_cast<uint32_t>(SettingValueType::BUTTON) == RENODX_HOST_KIND_BUTTON);
+static_assert(static_cast<uint32_t>(SettingValueType::CUSTOM) == RENODX_HOST_KIND_CUSTOM);
+static_assert(static_cast<uint32_t>(SettingValueType::INPUT_TEXT) == RENODX_HOST_KIND_INPUT_TEXT);
+static_assert(static_cast<uint32_t>(SettingStyle::SEGMENTED) == RENODX_HOST_STYLE_SEGMENTED);
+static_assert(static_cast<uint32_t>(SettingStyle::MULTILINE) == RENODX_HOST_STYLE_MULTILINE);
+
+// The size of RenoDxHostSetting as versions 1-3 defined it (it ended at is_global). describe_setting
+// accepts any struct_size from here up.
+inline constexpr uint32_t RENODX_HOST_SETTING_V1_SIZE =
+    static_cast<uint32_t>(offsetof(RenoDxHostSetting, is_global) + sizeof(int32_t));
 
 struct RenoDxHostApi {
   uint32_t struct_size;
@@ -1009,6 +1095,46 @@ struct RenoDxHostApi {
   // Version 3. Every setting the overlay's own reset touches (non-global, can_reset) back to its
   // default, then saved -- what "Reset all to default" does in a host's UI.
   void (*reset_settings)();
+
+  // ---- Version 4 ----
+  // Every function below does what the ReShade overlay does for the same click, through the same
+  // functions and callbacks, so a host panel and the overlay can be used interchangeably. Call them
+  // from the thread that presents (where ReShade draws its overlay), like the functions above.
+
+  // Presets. The overlay's switcher offers `preset_count` entries -- normally "Off", "Preset #1",
+  // "Preset #2", "Preset #3", but a mod may rename them -- and 0 when the mod turned presets off
+  // (then get_preset is -1 and set_preset refuses). Entry 0 is always Off: the mod's on_preset_off
+  // callback forces its vanilla look, and the overlay greys every control and hides every reset
+  // button until another preset is picked (a host should do the same while get_preset() == 0).
+  uint32_t (*preset_count)();
+  // Borrowed; valid until the next call into this API.
+  const char* (*preset_label)(uint32_t preset);
+  int32_t (*get_preset)();
+  // Exactly the overlay's switcher: Off runs the mod's on_preset_off callbacks; 1-3 load that
+  // preset's saved values from the `<addon_name>-preset<N>` config section; then the mod's
+  // on_preset_changed callbacks run (UE-Extended's remembers the choice as SelectedProfile there).
+  // It does not save setting values, as the overlay does not. True when `preset` was valid, including
+  // when it was already the current one (then nothing runs, as a click on the current entry does
+  // nothing in the overlay).
+  bool (*set_preset)(int32_t preset);
+  // RENODX_HOST_STYLE_* bits for the switcher itself: segmented buttons or a slider.
+  uint32_t (*preset_style)();
+
+  // The overlay's per-setting reset button: the setting back to its default (default_text for
+  // INPUT_TEXT), its on_change_value / on_change_text callback run, and the current preset plus
+  // global settings saved. False when the key is unknown, the setting has no reset button
+  // (RenoDxHostSetting::can_reset is 0) or the preset is Off (the overlay hides the button then).
+  bool (*reset_setting)(const char* key);
+  // A BUTTON setting's click. Takes the setting's index, not a key, because buttons usually have no
+  // key (links, "Reset All", game-specific one-shot actions). Runs the mod's on_click and, when that
+  // returns true (the default), its on_change -- which is where most buttons do their work -- then
+  // saves like the overlay. False when `index` is not a BUTTON, or the overlay would show the button
+  // disabled: is_enabled is 0, or the preset is Off. A button may open a URL in the user's browser.
+  bool (*press)(uint32_t index);
+  // The heading the mod gives its overlay page (what ReShade shows as the add-on's tab).
+  const char* (*overlay_title)();
+  // Whether the overlay opens `section` expanded when it first draws it.
+  bool (*section_open_by_default)(const char* section);
 };
 
 // The C ABI is only an ABI if the layout is one C understands, and that is a property a later
@@ -1049,7 +1175,9 @@ inline uint32_t ValueTypeOf(const Setting* setting) {
 }
 
 inline bool DescribeSetting(uint32_t index, RenoDxHostSetting* out) {
-  if (out == nullptr || out->struct_size < sizeof(RenoDxHostSetting)) return false;
+  // Any size from the version-1 layout up: a caller built before version 4 passes the shorter struct.
+  if (out == nullptr || out->struct_size < RENODX_HOST_SETTING_V1_SIZE) return false;
+  const bool wants_v4 = out->struct_size >= sizeof(RenoDxHostSetting);
   Setting* setting = nullptr;
   {
     const std::shared_lock lock(renodx::utils::mutex::global_mutex);
@@ -1066,6 +1194,23 @@ inline bool DescribeSetting(uint32_t index, RenoDxHostSetting* out) {
     out->max_value = setting->GetMax();
     out->label_count = static_cast<uint32_t>(setting->labels.size());
     out->is_global = setting->is_global ? 1 : 0;
+    if (wants_v4) {
+      out->kind = static_cast<uint32_t>(setting->value_type);
+      out->default_value = setting->default_value;
+      out->can_reset = setting->can_reset && setting->SupportsReset() ? 1 : 0;
+      out->is_using_default = setting->SupportsReset() && setting->IsUsingDefault() ? 1 : 0;
+      out->default_text = setting->default_text.c_str();
+      out->placeholder = setting->placeholder.c_str();
+      out->text_max_length = setting->HasTextBinding()
+                                 ? static_cast<uint32_t>(setting->text_binding_size - 1u)
+                                 : 0u;
+      out->input_text_flags = static_cast<uint32_t>(setting->input_text_flags);
+      out->style = static_cast<uint32_t>(setting->style);
+      out->has_tint = setting->tint.has_value() ? 1 : 0;
+      out->tint_rgb = setting->tint.value_or(0u) & 0xFFFFFFu;
+      out->is_logarithmic = setting->is_logarithmic ? 1 : 0;
+      out->is_sticky = setting->is_sticky ? 1 : 0;
+    }
   }
   // Outside the lock, because these two are the mod author's own lambdas and one of them calling
   // UpdateSetting would deadlock on a shared_mutex we already hold. The overlay's own draw path
@@ -1104,19 +1249,79 @@ inline bool GetText(const char* key, char* buf, uint32_t buf_size) {
   return true;
 }
 
+// The overlay's save after any edit: the current preset's section (none while the preset is Off) and
+// the global section.
+inline void SaveLikeOverlay() {
+  if (settings == nullptr) return;
+  switch (preset_index) {
+    case 1:
+    case 2:
+    case 3:
+      SaveSettings(global_name + "-preset" + std::to_string(preset_index));
+      break;
+    default:
+      break;
+  }
+  SaveGlobalSettings();
+}
+
+inline Setting* FindLocked(const char* key) {
+  if (key == nullptr || settings == nullptr) return nullptr;
+  const std::shared_lock lock(renodx::utils::mutex::global_mutex);
+  return FindSetting(key);
+}
+
+// After an edit, the callbacks the overlay runs for it, unlocked as the overlay runs them (a mod's
+// callback may call UpdateSetting, which takes the write lock).
+inline void RunChangeCallbacks(Setting* setting, float previous_value, const std::string& previous_text,
+                               bool run_on_change) {
+  if (run_on_change) setting->on_change();
+  if (setting->HasNumericValue()) {
+    setting->on_change_value(previous_value, setting->GetValue());
+  } else if (setting->value_type == SettingValueType::INPUT_TEXT) {
+    setting->on_change_text(previous_text, setting->GetTextValue());
+  }
+}
+
 inline bool SetNumber(const char* key, float value) {
-  // UpdateSetting takes the write lock and calls Set()->Write(), which is what runs the setting's
-  // on_change callbacks. Reaching past it into Setting::Set would skip them.
-  return key != nullptr && UpdateSetting(std::string(key), value);
+  // UpdateSetting takes the write lock and does Set()->Write(), as the overlay does after a slider
+  // moves; the overlay then runs on_change and on_change_value, so this does too (from version 4 --
+  // before that a host edit skipped them, and a setting that acts only in a callback, such as
+  // UE-Extended's Prevent Fullscreen, did nothing until the game restarted).
+  auto* setting = FindLocked(key);
+  if (setting == nullptr || !setting->HasNumericValue()) return false;
+  float previous = 0.f;
+  {
+    const std::shared_lock lock(renodx::utils::mutex::global_mutex);
+    previous = setting->GetValue();
+  }
+  if (!UpdateSetting(std::string(key), value)) return false;
+  RunChangeCallbacks(setting, previous, {}, true);
+  return true;
 }
 
 inline bool SetText(const char* key, const char* value) {
-  return key != nullptr && value != nullptr && UpdateSetting(std::string(key), std::string(value));
+  if (value == nullptr) return false;
+  auto* setting = FindLocked(key);
+  if (setting == nullptr || setting->value_type != SettingValueType::INPUT_TEXT) return false;
+  std::string previous;
+  {
+    const std::shared_lock lock(renodx::utils::mutex::global_mutex);
+    previous = setting->GetTextValue();
+  }
+  std::string text(value);
+  // A text bound to a fixed buffer keeps what fits, as the overlay's input box does; keep
+  // value_as_string the same so what is saved is what the mod reads.
+  if (setting->HasTextBinding() && text.size() > setting->text_binding_size - 1u) {
+    text.resize(setting->text_binding_size - 1u);
+  }
+  if (!UpdateSetting(std::string(key), text)) return false;
+  RunChangeCallbacks(setting, 0.f, previous, true);
+  return true;
 }
 
 inline void Save() {
-  SaveSettings();
-  SaveGlobalSettings();
+  SaveLikeOverlay();
 }
 
 inline bool ResolveClone(void* native_resource, void** out_native_resource) {
@@ -1152,6 +1357,109 @@ inline void ResetAll() {
   Save();
 }
 
+inline uint32_t PresetCount() {
+  return use_presets ? static_cast<uint32_t>(preset_strings.size()) : 0u;
+}
+
+inline const char* PresetLabel(uint32_t preset) {
+  if (!use_presets || preset >= preset_strings.size()) return nullptr;
+  return preset_strings[preset].c_str();
+}
+
+inline int32_t GetPreset() {
+  return use_presets ? static_cast<int32_t>(preset_index) : -1;
+}
+
+inline bool SetPreset(int32_t preset) {
+  if (!use_presets || settings == nullptr) return false;
+  if (preset < 0 || static_cast<size_t>(preset) >= preset_strings.size()) return false;
+  if (preset == preset_index) return true;
+  // The overlay's draw_presets, step for step.
+  preset_index = preset;
+  switch (preset_index) {
+    case 0:
+      for (auto& callback : on_preset_off_callbacks) {
+        callback();
+      }
+      break;
+    case 1:
+      LoadSettings(global_name + "-preset1");
+      break;
+    case 2:
+      LoadSettings(global_name + "-preset2");
+      break;
+    case 3:
+      LoadSettings(global_name + "-preset3");
+      break;
+    default:
+      break;
+  }
+  for (auto& callback : on_preset_changed_callbacks) {
+    callback();
+  }
+  return true;
+}
+
+inline uint32_t PresetStyle() {
+  return static_cast<uint32_t>(preset_style);
+}
+
+inline bool ResetSetting(const char* key) {
+  auto* setting = FindLocked(key);
+  if (setting == nullptr || !setting->can_reset || !setting->SupportsReset()) return false;
+  if (preset_index == 0) return false;
+  float previous_value = 0.f;
+  std::string previous_text;
+  {
+    const std::unique_lock lock(renodx::utils::mutex::global_mutex);
+    previous_value = setting->HasNumericValue() ? setting->GetValue() : 0.f;
+    if (setting->value_type == SettingValueType::INPUT_TEXT) {
+      previous_text = setting->GetTextValue();
+      setting->Set(setting->default_text);
+    } else {
+      setting->Set(setting->default_value);
+    }
+    setting->Write();
+  }
+  // The overlay's reset button runs the value callbacks but not on_change (that one is only for the
+  // widget itself changing).
+  RunChangeCallbacks(setting, previous_value, previous_text, false);
+  SaveLikeOverlay();
+  return true;
+}
+
+inline bool Press(uint32_t index) {
+  Setting* setting = nullptr;
+  {
+    const std::shared_lock lock(renodx::utils::mutex::global_mutex);
+    setting = At(index);
+  }
+  if (setting == nullptr || setting->value_type != SettingValueType::BUTTON) return false;
+  if (preset_index == 0) return false;
+  if (setting->is_enabled != nullptr && !setting->is_enabled()) return false;
+  // Unlocked, as the overlay calls them: a button's work is usually UpdateSetting/ResetSettings calls.
+  const bool changed = setting->on_click == nullptr || setting->on_click();
+  if (changed) {
+    setting->on_change();
+    {
+      const std::unique_lock lock(renodx::utils::mutex::global_mutex);
+      setting->Write();
+    }
+    SaveLikeOverlay();
+  }
+  return true;
+}
+
+inline const char* OverlayTitle() {
+  return overlay_title.c_str();
+}
+
+inline bool SectionOpenByDefault(const char* section) {
+  if (open_sections_by_default) return true;
+  if (section == nullptr) return false;
+  return std::ranges::find(default_open_sections, std::string(section)) != default_open_sections.end();
+}
+
 inline const RenoDxHostApi API = {
     .struct_size = sizeof(RenoDxHostApi),
     .api_version = HOST_API_VERSION,
@@ -1170,6 +1478,15 @@ inline const RenoDxHostApi API = {
     .encode_in_place_for_swapchain = EncodeInPlaceForSwapchain,
     .uses_swapchain_proxy = UsesSwapchainProxy,
     .reset_settings = ResetAll,
+    .preset_count = PresetCount,
+    .preset_label = PresetLabel,
+    .get_preset = GetPreset,
+    .set_preset = SetPreset,
+    .preset_style = PresetStyle,
+    .reset_setting = ResetSetting,
+    .press = Press,
+    .overlay_title = OverlayTitle,
+    .section_open_by_default = SectionOpenByDefault,
 };
 
 }  // namespace host_api_detail
