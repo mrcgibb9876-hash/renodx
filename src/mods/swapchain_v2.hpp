@@ -13,11 +13,13 @@
 #include <windef.h>
 
 #include <frozen/unordered_map.h>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <include/reshade_api_device.hpp>
+#include <initializer_list>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -427,6 +429,9 @@ struct EncodeJob {
   // the game set it and Streamline reads the game's own resource (what RenoDX's DLSS add-on does at the
   // DLSS-G evaluate). The output then has the image's own format.
   bool in_place = false;
+  // Set when the image and the output cannot be copied between (see RunEncodes); the job then does
+  // nothing and is no longer offered.
+  bool copies_refused = false;
   bool pending = false;
   // Set by the first pass that rendered, cleared by one that failed. Until it is set the host is told
   // there is nothing to substitute and tags the original image: an output Streamline never saw filled
@@ -538,17 +543,18 @@ inline bool Register(void* native_resource, uint32_t d3d12_state, bool keep_alph
     s << "mods::swapchain::streamline_tags(encoding " << (keep_alpha ? "UI " : "") << PRINT_PTR(resource.handle);
     s << " " << desc.texture.width << "x" << desc.texture.height << " " << desc.texture.format;
     s << " into " << PRINT_PTR(job.output.handle) << " " << output_desc.texture.format;
-    s << (in_place ? ", copied back into it" : "") << " at each present)";
+    s << (in_place ? ", copied back into it" : "") << " at each present, tagged in state ";
+    s << d3d12_state << ")";
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
   job.state = UsageFromD3D12State(d3d12_state);
   job.pending = true;
 
   // Copy-back leaves the tag alone, so there is nothing unfilled to hand out: a failed pass just does not
-  // copy back, and the image stays the game's own.
-  if (in_place) return true;
+  // copy back, and the image stays the game's own. Refused copies make it say no, so the host moves on.
+  if (in_place) return !job.copies_refused;
 
-  if (!job.valid) return false;
+  if (!job.valid || job.copies_refused) return false;
 
   *out_native_resource = reinterpret_cast<void*>(job.output.handle);
   *out_d3d12_state = static_cast<uint32_t>(reshade::api::resource_usage::shader_resource);
@@ -569,11 +575,37 @@ inline bool EncodeInPlaceForSwapchain(void* native_resource, uint32_t d3d12_stat
   return Register(native_resource, d3d12_state, is_ui, true, nullptr, nullptr);
 }
 
+// One barrier call for every transition that changes something. D3D12 rejects a transition whose before
+// and after states are equal, and the command list then fails to close (E_INVALIDARG) -- which is what the
+// first copy-back did, because the game had tagged its image in COPY_DEST, the state copy-back also moves it
+// to. Every state change below goes through here.
+struct Transition {
+  reshade::api::resource resource;
+  reshade::api::resource_usage before;
+  reshade::api::resource_usage after;
+};
+
+inline void Transitions(reshade::api::command_list* cmd_list, std::initializer_list<Transition> transitions) {
+  std::array<reshade::api::resource, 4> resources = {};
+  std::array<reshade::api::resource_usage, 4> before = {};
+  std::array<reshade::api::resource_usage, 4> after = {};
+  uint32_t count = 0u;
+  for (const auto& transition : transitions) {
+    if (transition.before == transition.after || count == resources.size()) continue;
+    resources[count] = transition.resource;
+    before[count] = transition.before;
+    after[count] = transition.after;
+    ++count;
+  }
+  if (count != 0u) cmd_list->barrier(count, resources.data(), before.data(), after.data());
+}
+
 // At present, before the frame leaves ReShade (and so before Streamline reads the tags).
 inline void RunEncodes(reshade::api::command_queue* queue, DeviceData* data) {
   const std::unique_lock lock(jobs_mutex);
   if (jobs.empty()) return;
 
+  using usage = reshade::api::resource_usage;
   auto* cmd_list = queue->get_immediate_command_list();
   auto* device = queue->get_device();
   for (auto it = jobs.begin(); it != jobs.end();) {
@@ -582,12 +614,12 @@ inline void RunEncodes(reshade::api::command_queue* queue, DeviceData* data) {
 
     bool alive = false;
     reshade::api::resource source = tagged;
+    reshade::api::resource_desc tagged_desc = {};
     reshade::api::format source_format = reshade::api::format::unknown;
-    reshade::api::format tagged_format = reshade::api::format::unknown;
     utils::resource::GetResourceInfo(tagged, [&](const utils::resource::ResourceInfo& info) {
       alive = !info.destroyed;
-      tagged_format = info.desc.texture.format;
-      source_format = tagged_format;
+      tagged_desc = info.desc;
+      source_format = info.desc.texture.format;
       if (info.clone_enabled && info.clone.handle != 0u) {
         source = info.clone;
         source_format = info.clone_desc.texture.format;
@@ -608,28 +640,39 @@ inline void RunEncodes(reshade::api::command_queue* queue, DeviceData* data) {
     // The UI image's alpha is copied, so it has to be the image itself, in its own format, not a clone.
     if (job.keep_alpha) {
       source = tagged;
-      source_format = tagged_format;
+      source_format = tagged_desc.texture.format;
     }
 
-    // A tagged image already in a shader resource state needs no transition of its own.
-    const bool move_source = job.state != reshade::api::resource_usage::shader_resource;
+    // Every copy is checked before it is recorded: an invalid one would poison the whole immediate
+    // command list. A copy that does not qualify turns the job's copies off and it stops being offered.
+    const bool copies_valid =
+        tagged_desc.texture.width == job.output_desc.texture.width
+        && tagged_desc.texture.height == job.output_desc.texture.height
+        && tagged_desc.texture.samples == job.output_desc.texture.samples
+        && reshade::api::format_to_typeless(tagged_desc.texture.format)
+               == reshade::api::format_to_typeless(job.output_desc.texture.format);
+    if ((job.keep_alpha || job.in_place) && !copies_valid) {
+      if (!job.copies_refused) {
+        job.copies_refused = true;
+        std::stringstream s;
+        s << "mods::swapchain::streamline_tags(" << PRINT_PTR(tagged.handle) << " " << tagged_desc.texture.format;
+        s << " cannot be copied to or from " << job.output_desc.texture.format << ", left as the game wrote it)";
+        reshade::log::message(reshade::log::level::warning, s.str().c_str());
+      }
+      job.valid = false;
+      ++it;
+      continue;
+    }
+
     if (job.keep_alpha) {
-      const std::array copy_resources = {job.output, source};
-      const std::array copy_old = {reshade::api::resource_usage::shader_resource, job.state};
-      const std::array copy_new = {reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::copy_source};
-      cmd_list->barrier(2u, copy_resources.data(), copy_old.data(), copy_new.data());
+      Transitions(cmd_list, {{job.output, usage::shader_resource, usage::copy_dest},
+                             {source, job.state, usage::copy_source}});
       cmd_list->copy_resource(source, job.output);
-      const std::array draw_old = {reshade::api::resource_usage::copy_dest,
-                                   reshade::api::resource_usage::copy_source};
-      const std::array draw_new = {reshade::api::resource_usage::render_target,
-                                   reshade::api::resource_usage::shader_resource};
-      cmd_list->barrier(2u, copy_resources.data(), draw_old.data(), draw_new.data());
+      Transitions(cmd_list, {{job.output, usage::copy_dest, usage::render_target},
+                             {source, usage::copy_source, usage::shader_resource}});
     } else {
-      const std::array pre_resources = {job.output, source};
-      const std::array pre_old = {reshade::api::resource_usage::shader_resource, job.state};
-      const std::array pre_new = {reshade::api::resource_usage::render_target,
-                                  reshade::api::resource_usage::shader_resource};
-      cmd_list->barrier(move_source ? 2u : 1u, pre_resources.data(), pre_old.data(), pre_new.data());
+      Transitions(cmd_list, {{job.output, usage::shader_resource, usage::render_target},
+                             {source, job.state, usage::shader_resource}});
     }
 
     auto& pass = job.pass;
@@ -668,19 +711,18 @@ inline void RunEncodes(reshade::api::command_queue* queue, DeviceData* data) {
     }
     const bool rendered = pass.Render(cmd_list, queue);
 
-    const std::array post_resources = {job.output, source};
-    const std::array post_old = {reshade::api::resource_usage::render_target,
-                                 reshade::api::resource_usage::shader_resource};
-    const std::array post_new = {reshade::api::resource_usage::shader_resource, job.state};
-    cmd_list->barrier(move_source ? 2u : 1u, post_resources.data(), post_old.data(), post_new.data());
-
     if (rendered && job.in_place) {
-      const std::array back_resources = {job.output, tagged};
-      const std::array back_old = {reshade::api::resource_usage::shader_resource, job.state};
-      const std::array back_new = {reshade::api::resource_usage::copy_source, reshade::api::resource_usage::copy_dest};
-      cmd_list->barrier(2u, back_resources.data(), back_old.data(), back_new.data());
+      // Straight from the render target state into the copy, and the image from wherever the pass left
+      // it; both then back to where they belong.
+      Transitions(cmd_list, {{job.output, usage::render_target, usage::copy_source},
+                             {source, usage::shader_resource, job.state}});
+      Transitions(cmd_list, {{tagged, job.state, usage::copy_dest}});
       cmd_list->copy_resource(job.output, tagged);
-      cmd_list->barrier(2u, back_resources.data(), back_new.data(), back_old.data());
+      Transitions(cmd_list, {{job.output, usage::copy_source, usage::shader_resource},
+                             {tagged, usage::copy_dest, job.state}});
+    } else {
+      Transitions(cmd_list, {{job.output, usage::render_target, usage::shader_resource},
+                             {source, usage::shader_resource, job.state}});
     }
 
     if (rendered != job.valid) {
