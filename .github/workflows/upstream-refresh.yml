@@ -1,0 +1,387 @@
+name: upstream-refresh
+
+# Fork-only workflow (mrcgibb9876-hash/renodx). It never touches `main` or the `snapshot` release.
+#
+# Weekly (and on demand) it checks clshortfuse/renodx main. When upstream has moved:
+#   1. force-updates the mirror branch `upstream-main` to upstream main (never `main`)
+#   2. builds `upstream-refresh/<date>` = upstream main + cherry-pick of our host-API commits
+#      (the commits on HOST_BRANCH that upstream main does not have)
+#   3. builds the add-ons exactly like snapshot.yml does
+#   4. publishes them to the PRE-RELEASE tag `upstream-refresh` (never `snapshot`, which the app
+#      downloads)
+#   5. opens or updates one issue "RenoDX upstream refresh ready: ..." listing the new commits and
+#      new/changed game mods, with the test link
+# Promoting to `snapshot` is a manual step after testing: dispatch snapshot.yml on the refresh
+# branch. On a cherry-pick conflict the issue says so and nothing is built.
+
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      host_branch:
+        description: Branch whose extra commits (vs upstream main) are cherry-picked onto upstream
+        type: string
+        default: feat/host-api
+      force:
+        description: Rebuild even if upstream has not moved since the last refresh
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-refresh
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/clshortfuse/renodx.git
+  UPSTREAM_REPO: clshortfuse/renodx
+  UPSTREAM_BRANCH: main
+  MIRROR_BRANCH: upstream-main
+  HOST_BRANCH: ${{ inputs.host_branch || 'feat/host-api' }}
+  REFRESH_PREFIX: upstream-refresh/
+  RELEASE_TAG: upstream-refresh
+  ISSUE_LABEL: upstream-refresh
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+      conflict: ${{ steps.pick.outputs.conflict }}
+      pushed: ${{ steps.pick.outputs.pushed }}
+      branch: ${{ steps.pick.outputs.branch }}
+      sha: ${{ steps.pick.outputs.sha }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      count: ${{ steps.check.outputs.count }}
+      mods: ${{ steps.check.outputs.mods }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Optional PAT (repo + workflow scopes). GITHUB_TOKEN may not push branches whose new
+          # commits change .github/workflows, which upstream commits sometimes do.
+          token: ${{ secrets.RENODX_PUSH_TOKEN || github.token }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch origin and upstream
+        run: |
+          git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+          git fetch origin
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream "$UPSTREAM_BRANCH"
+          git rev-parse -q --verify "origin/$HOST_BRANCH" >/dev/null || { echo "::error::Branch $HOST_BRANCH does not exist."; exit 1; }
+
+      - name: Has upstream moved?
+        id: check
+        env:
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          UP="upstream/$UPSTREAM_BRANCH"
+          echo "upstream_sha=$(git rev-parse "$UP")" >> "$GITHUB_OUTPUT"
+
+          # New = upstream commits our host-API branch (what the app's snapshot is built from) lacks.
+          COUNT=$(git rev-list --count "origin/$HOST_BRANCH..$UP")
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+          PROCEED=true
+          if [ "$COUNT" -eq 0 ]; then
+            echo "$HOST_BRANCH already contains upstream main. Nothing to do."
+            PROCEED=false
+          elif [ "$FORCE" != "true" ] && git rev-parse -q --verify "origin/$MIRROR_BRANCH" >/dev/null \
+               && [ "$(git rev-parse "origin/$MIRROR_BRANCH")" = "$(git rev-parse "$UP")" ]; then
+            echo "Upstream has not moved since the last refresh ($MIRROR_BRANCH is current). Dispatch with force to rebuild."
+            PROCEED=false
+          fi
+          echo "proceed=$PROCEED" >> "$GITHUB_OUTPUT"
+          [ "$PROCEED" = "true" ] || exit 0
+
+          # New or changed game mods = folders under src/games that upstream added or touched
+          # since the upstream commit our host-API branch is based on.
+          BASE=$(git merge-base "origin/$HOST_BRANCH" "$UP")
+          : > "$RUNNER_TEMP/mods.txt"
+          for g in $(git diff --name-only "$BASE" "$UP" -- src/games | cut -d/ -f3 | sort -u); do
+            if git cat-file -e "$BASE:src/games/$g" 2>/dev/null; then
+              echo "- \`$g\` (changed)" >> "$RUNNER_TEMP/mods.txt"
+            elif git cat-file -e "$UP:src/games/$g" 2>/dev/null; then
+              echo "- \`$g\` (**new**)" >> "$RUNNER_TEMP/mods.txt"
+            else
+              echo "- \`$g\` (removed)" >> "$RUNNER_TEMP/mods.txt"
+            fi
+          done
+          {
+            echo "mods<<MODS_EOF"
+            cat "$RUNNER_TEMP/mods.txt"
+            echo "MODS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Refresh the upstream-main mirror (never main)
+        if: steps.check.outputs.proceed == 'true'
+        run: |
+          if ! git push --force origin "upstream/$UPSTREAM_BRANCH:refs/heads/$MIRROR_BRANCH"; then
+            echo "::warning::Could not update $MIRROR_BRANCH (probably upstream changed .github/workflows and the token lacks the workflow scope; set RENODX_PUSH_TOKEN)."
+          fi
+
+      - name: Build the refresh branch (upstream main + host-API commits)
+        id: pick
+        if: steps.check.outputs.proceed == 'true'
+        run: |
+          UP="upstream/$UPSTREAM_BRANCH"
+          BRANCH="${REFRESH_PREFIX}$(date -u +%Y-%m-%d)"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+          git rev-list --reverse --no-merges "$UP..origin/$HOST_BRANCH" > "$RUNNER_TEMP/ours.txt"
+          echo "Cherry-picking $(wc -l < "$RUNNER_TEMP/ours.txt") commit(s) from $HOST_BRANCH:"
+          [ -s "$RUNNER_TEMP/ours.txt" ] && git log --no-walk=unsorted --oneline $(cat "$RUNNER_TEMP/ours.txt")
+
+          git checkout -B "$BRANCH" "$UP"
+          CONFLICT=false
+          while read -r c; do
+            if ! git cherry-pick -x "$c"; then
+              CONFLICT=true
+              {
+                echo "Cherry-pick of \`$(git log -1 --format='%h %s' "$c")\` conflicted in:"
+                git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/'
+              } > "$RUNNER_TEMP/conflict.md"
+              git cherry-pick --abort
+              break
+            fi
+          done < "$RUNNER_TEMP/ours.txt"
+          echo "conflict=$CONFLICT" >> "$GITHUB_OUTPUT"
+          {
+            echo "conflict_md<<CONFLICT_EOF"
+            cat "$RUNNER_TEMP/conflict.md" 2>/dev/null || true
+            echo "CONFLICT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$CONFLICT" = "true" ]; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # Our own bot branch; never main.
+          if git push --force origin "HEAD:refs/heads/$BRANCH"; then
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Could not push $BRANCH. If upstream changed .github/workflows, GITHUB_TOKEN may not push it: add a RENODX_PUSH_TOKEN secret (PAT with repo + workflow scopes)."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report a conflict or push failure (no build)
+        if: steps.check.outputs.proceed == 'true' && (steps.pick.outputs.conflict == 'true' || steps.pick.outputs.pushed != 'true')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COUNT: ${{ steps.check.outputs.count }}
+          CONFLICT: ${{ steps.pick.outputs.conflict }}
+          CONFLICT_MD: ${{ steps.pick.outputs.conflict_md }}
+          MODS: ${{ steps.check.outputs.mods }}
+          UPSTREAM_SHA: ${{ steps.check.outputs.upstream_sha }}
+        run: |
+          M=$(printf '%s\n' "$MODS" | grep -c '^- ' || true)
+          TITLE="RenoDX upstream refresh ready: $COUNT new commits, $M new/changed game mods (NOT BUILT)"
+          {
+            echo "Upstream \`$UPSTREAM_REPO:$UPSTREAM_BRANCH\` is at \`${UPSTREAM_SHA:0:8}\`, $COUNT commits ahead of \`$HOST_BRANCH\`."
+            echo
+            if [ "$CONFLICT" = "true" ]; then
+              echo "> [!WARNING]"
+              echo "> **Cherry-pick conflict** while putting the \`$HOST_BRANCH\` commits on top of upstream main. Nothing was built or published."
+              echo
+              printf '%s\n' "$CONFLICT_MD"
+              echo
+              echo "Resolve by hand: \`git fetch upstream && git checkout -b upstream-refresh/manual upstream/main && git cherry-pick <host-API commits>\`, fix, push, then dispatch **upstream-refresh**'s build or **snapshot** after testing."
+            else
+              echo "> [!WARNING]"
+              echo "> The refresh branch could not be pushed (likely upstream changed \`.github/workflows\` and \`GITHUB_TOKEN\` lacks the workflow scope). Add a \`RENODX_PUSH_TOKEN\` secret or push it by hand. Nothing was built."
+            fi
+            echo
+            echo "### New/changed game mods ($M)"
+            printf '%s\n' "${MODS:-_none_}"
+            echo
+            echo "[Compare $HOST_BRANCH...upstream main](https://github.com/$UPSTREAM_REPO/compare/$(git rev-parse --short "origin/$HOST_BRANCH")...$UPSTREAM_SHA)"
+          } > "$RUNNER_TEMP/body.md"
+          gh label create "$ISSUE_LABEL" --color 0e8a16 --description "Upstream RenoDX refresh" --force
+          N=$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$N" ]; then
+            gh issue edit "$N" --title "$TITLE" --body-file "$RUNNER_TEMP/body.md"
+            gh issue comment "$N" --body "Refreshed by run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} (not built)."
+          else
+            gh issue create --title "$TITLE" --label "$ISSUE_LABEL" --body-file "$RUNNER_TEMP/body.md"
+          fi
+
+  # Same build steps as snapshot.yml's build job; only the checkout ref and the publish step differ.
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.proceed == 'true' && needs.prepare.outputs.conflict != 'true' && needs.prepare.outputs.pushed == 'true'
+    runs-on: windows-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_CACHE_SIZE: "5G"
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: "snapshot"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          submodules: recursive
+          lfs: true
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up shader tools
+        shell: pwsh
+        run: .\scripts\setup-dev-env.ps1 -Update -Tools dxc,slang,glslang
+
+      - name: Set up Clang
+        uses: egor-tensin/setup-clang@v1
+        with:
+          version: latest
+          platform: x64
+
+      - name: Install ninja-build tool
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Configure build for amd64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Configure CMake (x64)
+        run: cmake --preset clang-x64 -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Build (x64)
+        run: cmake --build --preset clang-x64-release --verbose
+
+      - name: Set up Clang
+        uses: egor-tensin/setup-clang@v1
+        with:
+          version: latest
+          platform: x86
+
+      - name: Configure build for x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_x86
+
+      - name: Configure CMake (x86)
+        run: cmake --preset clang-x86 -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Build (x86)
+        run: cmake --build --preset clang-x86-release --verbose
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+      - name: Prepare Release folder
+        run: md githubrelease
+
+      - name: Copy Schema
+        run: copy renodx-metadata-schema.json githubrelease\
+
+      - name: Copy Binaries (x64)
+        run: copy build\release\*.addon64 githubrelease\
+
+      - name: Copy Binaries (x86)
+        run: copy build32\release\*.addon32 githubrelease\
+
+      - name: Copy Binaries (Tools)
+        run: copy build\release\*.exe githubrelease\
+
+      - name: Copy Binaries (PDBs)
+        run: copy build\release\*.pdb githubrelease\
+
+      - name: Generate metadata manifest
+        run: node scripts/generate-release-manifest.mjs
+
+      - name: Build web UI
+        run: node src/web/scripts/build.mjs
+
+      # Publishes ONLY to the upstream-refresh pre-release. The `snapshot` tag is never touched here.
+      - name: Publish to the upstream-refresh pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+        run: |
+          set -e
+          test "$RELEASE_TAG" != "snapshot"
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+          git push origin ":refs/tags/$RELEASE_TAG" 2>/dev/null || true
+          gh release create "$RELEASE_TAG" \
+            --target "$SHA" \
+            --prerelease \
+            --latest=false \
+            --title "RenoDX upstream refresh (test build, $BRANCH)" \
+            --notes "Test build of \`$BRANCH\` (\`${SHA:0:8}\`) = upstream $UPSTREAM_REPO main + our host-API commits. NOT the app's snapshot. Promote after testing by dispatching snapshot.yml on \`$BRANCH\`." \
+            githubrelease/*
+
+  report:
+    needs: [prepare, build]
+    if: always() && needs.prepare.outputs.proceed == 'true' && needs.prepare.outputs.conflict != 'true' && needs.prepare.outputs.pushed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD: ${{ needs.build.result }}
+          COUNT: ${{ needs.prepare.outputs.count }}
+          MODS: ${{ needs.prepare.outputs.mods }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          M=$(printf '%s\n' "$MODS" | grep -c '^- ' || true)
+          if [ "$BUILD" = "success" ]; then
+            TITLE="RenoDX upstream refresh ready: $COUNT new commits, $M new/changed game mods"
+          else
+            TITLE="RenoDX upstream refresh: $COUNT new commits, $M new/changed game mods (BUILD FAILED)"
+          fi
+          REL="https://github.com/$GH_REPO/releases/tag/$RELEASE_TAG"
+          {
+            echo "Upstream \`$UPSTREAM_REPO:$UPSTREAM_BRANCH\` (\`${UPSTREAM_SHA:0:8}\`) is $COUNT commits ahead of \`$HOST_BRANCH\`."
+            echo
+            echo "- Branch: [\`$BRANCH\`](https://github.com/$GH_REPO/tree/$BRANCH) (\`${SHA:0:8}\`) = upstream main + cherry-picked \`$HOST_BRANCH\` commits"
+            if [ "$BUILD" = "success" ]; then
+              echo "- **Test build:** $REL (pre-release \`$RELEASE_TAG\`; the app still uses \`snapshot\`, untouched)"
+            else
+              echo "- **Build $BUILD** - see $RUN_URL. Nothing was published."
+            fi
+            echo "- [Upstream changes since our base](https://github.com/$UPSTREAM_REPO/compare/$(git ls-remote "https://github.com/$GH_REPO.git" "refs/heads/$HOST_BRANCH" | cut -c1-12)...$UPSTREAM_SHA)"
+            echo "- Run: $RUN_URL"
+            echo
+            echo "### New/changed game mods ($M)"
+            printf '%s\n' "${MODS:-_none_}"
+            echo
+            echo "### To test and promote"
+            echo "1. Download the add-ons from the \`$RELEASE_TAG\` pre-release and test (host API / HDR panel, a DLSS-G game, the new mods above)."
+            echo "2. Promote to \`snapshot\` (what the app downloads) **only after testing**: \`gh workflow run snapshot.yml -R $GH_REPO --ref $BRANCH\`."
+            echo "3. Optionally move \`$HOST_BRANCH\` to the tested branch."
+            echo
+            echo "_Nothing is merged or promoted automatically._"
+          } > body.md
+          gh label create "$ISSUE_LABEL" --color 0e8a16 --description "Upstream RenoDX refresh" --force
+          N=$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$N" ]; then
+            gh issue edit "$N" --title "$TITLE" --body-file body.md
+            gh issue comment "$N" --body "Refreshed by $RUN_URL (build: $BUILD)."
+          else
+            gh issue create --title "$TITLE" --label "$ISSUE_LABEL" --body-file body.md
+          fi
