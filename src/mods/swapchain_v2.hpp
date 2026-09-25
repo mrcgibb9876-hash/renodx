@@ -424,6 +424,10 @@ struct EncodeJob {
   // pass only writes colour into it.
   bool keep_alpha = false;
   bool pending = false;
+  // Set by the first pass that rendered, cleared by one that failed. Until it is set the host is told
+  // there is nothing to substitute and tags the original image: an output Streamline never saw filled
+  // must never reach it (an unfilled UI image made DLSS-G's feature creation fail and the GPU fault).
+  bool valid = false;
   renodx::utils::render::RenderPass pass;
 };
 
@@ -470,10 +474,13 @@ inline bool Register(void* native_resource, uint32_t d3d12_state, bool keep_alph
   const auto swapchain_format = data->primary_swapchain_resource_desc.texture.format;
   if (swapchain_format == reshade::api::format::unknown) return false;
 
+  // The UI image keeps its own format (it may be typeless, like Unreal's B8G8R8A8; the views below are
+  // typed) and the usages it was created with, so Streamline sees the same kind of resource the game gave.
   const reshade::api::resource_desc output_desc(
       desc.texture.width, desc.texture.height, 1, 1, keep_alpha ? desc.texture.format : swapchain_format, 1,
       reshade::api::memory_heap::gpu_only,
-      reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource
+      (keep_alpha ? desc.usage : reshade::api::resource_usage::undefined)
+          | reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource
           | reshade::api::resource_usage::copy_dest);
 
   const std::unique_lock lock(jobs_mutex);
@@ -529,6 +536,8 @@ inline bool Register(void* native_resource, uint32_t d3d12_state, bool keep_alph
   job.state = UsageFromD3D12State(d3d12_state);
   job.pending = true;
 
+  if (!job.valid) return false;
+
   *out_native_resource = reinterpret_cast<void*>(job.output.handle);
   *out_d3d12_state = static_cast<uint32_t>(reshade::api::resource_usage::shader_resource);
   return true;
@@ -557,9 +566,16 @@ inline void RunEncodes(reshade::api::command_queue* queue, DeviceData* data) {
 
     bool alive = false;
     reshade::api::resource source = tagged;
+    reshade::api::format source_format = reshade::api::format::unknown;
+    reshade::api::format tagged_format = reshade::api::format::unknown;
     utils::resource::GetResourceInfo(tagged, [&](const utils::resource::ResourceInfo& info) {
       alive = !info.destroyed;
-      if (info.clone_enabled && info.clone.handle != 0u) source = info.clone;
+      tagged_format = info.desc.texture.format;
+      source_format = tagged_format;
+      if (info.clone_enabled && info.clone.handle != 0u) {
+        source = info.clone;
+        source_format = info.clone_desc.texture.format;
+      }
     });
     if (!alive) {
       job.pass.DestroyAll(job.device);
@@ -574,7 +590,10 @@ inline void RunEncodes(reshade::api::command_queue* queue, DeviceData* data) {
     job.pending = false;
 
     // The UI image's alpha is copied, so it has to be the image itself, in its own format, not a clone.
-    if (job.keep_alpha) source = tagged;
+    if (job.keep_alpha) {
+      source = tagged;
+      source_format = tagged_format;
+    }
 
     // A tagged image already in a shader resource state needs no transition of its own.
     const bool move_source = job.state != reshade::api::resource_usage::shader_resource;
@@ -603,12 +622,17 @@ inline void RunEncodes(reshade::api::command_queue* queue, DeviceData* data) {
       pass.render_target_slots.view_descs.clear();
       pass.render_target_slots.resource_descs.clear();
       pass.render_target_slots.resources = {job.output};
+      // Typed views: a render target view cannot be typeless.
+      pass.render_target_slots.view_descs = {
+          reshade::api::resource_view_desc(reshade::api::format_to_default_typed(job.output_desc.texture.format))};
     }
     if (pass.shader_resource_slots.resources.size() != 1 || pass.shader_resource_slots.resources[0].handle != source.handle) {
       pass.shader_resource_slots.views.clear();
       pass.shader_resource_slots.view_descs.clear();
       pass.shader_resource_slots.resource_descs.clear();
       pass.shader_resource_slots.resources = {source};
+      pass.shader_resource_slots.view_descs = {
+          reshade::api::resource_view_desc(reshade::api::format_to_default_typed(source_format))};
     }
     pass.revert_state_after_render = false;
     pass.render_target_load_op = reshade::api::render_pass_load_op::discard;
@@ -634,14 +658,14 @@ inline void RunEncodes(reshade::api::command_queue* queue, DeviceData* data) {
     const std::array post_new = {reshade::api::resource_usage::shader_resource, job.state};
     cmd_list->barrier(move_source ? 2u : 1u, post_resources.data(), post_old.data(), post_new.data());
 
-    if (!rendered) {
-      static bool warned = false;
-      if (!warned) {
-        warned = true;
-        reshade::log::message(reshade::log::level::warning,
-                              "mods::swapchain::streamline_tags(swap chain proxy pass over a tagged image failed)");
-      }
+    if (rendered != job.valid) {
+      std::stringstream s;
+      s << "mods::swapchain::streamline_tags(" << (job.keep_alpha ? "UI " : "") << PRINT_PTR(tagged.handle);
+      s << (rendered ? " encoded, handed to the host from now on)"
+                     : " swap chain proxy pass failed, the host tags the original image)");
+      reshade::log::message(rendered ? reshade::log::level::info : reshade::log::level::warning, s.str().c_str());
     }
+    job.valid = rendered;
     ++it;
   }
 }
