@@ -56,6 +56,12 @@ jobs:
           md githubrelease
           copy build\release\renodx-ue-extended.* githubrelease\
 
+      # UE-Extended's tuned-title table (marat569's GameSettings in addon.cpp) as JSON, published beside
+      # the add-on so a host app can refresh its list whenever this build changes. The script fails the
+      # build if it does not understand the table's layout rather than shipping a short list.
+      - name: Export UE-Extended tuned titles
+        run: node scripts/ue-extended-games.mjs --out githubrelease/ue-extended-games.json
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -68,5 +74,5 @@ jobs:
           repo_token: "${{ secrets.GITHUB_TOKEN }}"
           automatic_release_tag: test-ue-extended
           prerelease: true
-          title: RenoDX test build (UE-Extended + host API v4, feat/ue-extended)
+          title: RenoDX test build (marat569's UE-Extended + our host API v4, feat/ue-extended)
           files: githubrelease/*
